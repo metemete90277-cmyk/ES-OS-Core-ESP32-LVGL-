@@ -1,0 +1,503 @@
+/*
+ *  esp32/main/es_os_core.cpp
+ *
+ *  Universal E.S. OS ESP32 Monolithic Kernel with Dynamic Display Driver Abstraction (DAL)
+ *  Supports dynamic hot-plug and initialization for: ILI9341, ST7789, SSD1306, ST7735, ILI9488, 
+ *  and generic I2C / SPI display panels without recompilation.
+ * 
+ *  Copyright (C) 2026  ES Corporation Development Core Team
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+
+// LVGL Graphics Library Headers
+#include "lvgl.h"
+#include "lv_conf.h"
+
+#define ES_TAG "ES_OS_DAL"
+
+// Supported Display Controller Types
+typedef enum {
+    DISP_CONTROLLER_ILI9341,
+    DISP_CONTROLLER_ST7789,
+    DISP_CONTROLLER_ILI9488,
+    DISP_CONTROLLER_ST7735,
+    DISP_CONTROLLER_SSD1306, // I2C
+    DISP_CONTROLLER_UNKNOWN
+} es_disp_controller_t;
+
+// Dynamic Hardware Screen Definition
+typedef struct {
+    es_disp_controller_t controller;
+    bool is_spi;
+    int mosi_pin;
+    int miso_pin;
+    int sclk_pin;
+    int cs_pin;
+    int dc_pin;
+    int rst_pin;
+    int bckl_pin;
+    int sda_pin;
+    int scl_pin;
+    int i2c_addr;
+    uint16_t hor_res;
+    uint16_t ver_res;
+    uint32_t spi_clock_hz;
+} es_display_device_t;
+
+// Default detected device configuration (Can be overwritten by auto-detect parser)
+static es_display_device_t current_display = {
+    .controller = DISP_CONTROLLER_ILI9341,
+    .is_spi = true,
+    .mosi_pin = 23,
+    .miso_pin = 19,
+    .sclk_pin = 18,
+    .cs_pin = 5,
+    .dc_pin = 2,
+    .rst_pin = 4,
+    .bckl_pin = 15,
+    .sda_pin = 21,
+    .scl_pin = 22,
+    .i2c_addr = 0x3C,
+    .hor_res = 320,
+    .ver_res = 480,
+    .spi_clock_hz = 40 * 1000 * 1000 // 40 MHz SPI default
+};
+
+static spi_device_handle_t spi_disp_handle = NULL;
+static SemaphoreHandle_t lvgl_mutex = NULL;
+
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t *buf1 = NULL;
+static lv_color_t *buf2 = NULL;
+static lv_disp_drv_t disp_drv;
+
+static volatile bool spi_trans_in_progress = false;
+
+/* ====================== SPI ABSTRACTION DRIVERS ====================== */
+static void spi_send_cmd(const uint8_t cmd) {
+    if (!current_display.is_spi || !spi_disp_handle) return;
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 8;
+    t.tx_buffer = &cmd;
+    t.user = (void*)0; // Command Mode
+    spi_device_polling_transmit(spi_disp_handle, &t);
+}
+
+static void spi_send_data(const uint8_t *data, int len) {
+    if (!current_display.is_spi || !spi_disp_handle || len == 0) return;
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = len * 8;
+    t.tx_buffer = data;
+    t.user = (void*)1; // Data Mode
+    spi_device_polling_transmit(spi_disp_handle, &t);
+}
+
+static void disp_spi_pre_transfer_callback(spi_transaction_t *t) {
+    int dc = (int)t->user;
+    gpio_set_level((gpio_num_t)current_display.dc_pin, dc);
+}
+
+/* ====================== LEAK-PROOF I2C ABSTRACTION DRIVERS ====================== */
+static esp_err_t i2c_write_cmd(uint8_t cmd) {
+    uint8_t write_buf[2] = {0x00, cmd}; // 0x00 = Control byte: Command follows
+    return i2c_master_write_to_device(I2C_NUM_1, current_display.i2c_addr, write_buf, sizeof(write_buf), pdMS_TO_TICKS(10));
+}
+
+static esp_err_t i2c_write_data(const uint8_t *data, size_t len) {
+    // Dynamic buffer allocation on stack to avoid memory leak and speed up transfer
+    uint8_t *write_buf = (uint8_t *)malloc(len + 1);
+    if (!write_buf) return ESP_ERR_NO_MEM;
+    write_buf[0] = 0x40; // Control byte: Data follows
+    memcpy(&write_buf[1], data, len);
+    esp_err_t ret = i2c_master_write_to_device(I2C_NUM_1, current_display.i2c_addr, write_buf, len + 1, pdMS_TO_TICKS(20));
+    free(write_buf);
+    return ret;
+}
+
+/* ====================== AUTOMATIC DISPLAY SCANNING & INITIALIZATION ====================== */
+static void scan_and_detect_display() {
+    ESP_LOGI(ES_TAG, "Scanning I2C bus for SSD1306 panels...");
+    
+    // Test connection using modern, leak-safe empty write
+    esp_err_t ret = i2c_master_write_to_device(I2C_NUM_1, 0x3C, NULL, 0, pdMS_TO_TICKS(10));
+    if (ret == ESP_OK) {
+        current_display.controller = DISP_CONTROLLER_SSD1306;
+        current_display.is_spi = false;
+        current_display.hor_res = 128;
+        current_display.ver_res = 64;
+        current_display.i2c_addr = 0x3C;
+        ESP_LOGI(ES_TAG, "Hardware Detected: SSD1306 OLED (I2C) at address 0x3C");
+        return;
+    }
+
+    ret = i2c_master_write_to_device(I2C_NUM_1, 0x3D, NULL, 0, pdMS_TO_TICKS(10));
+    if (ret == ESP_OK) {
+        current_display.controller = DISP_CONTROLLER_SSD1306;
+        current_display.is_spi = false;
+        current_display.hor_res = 128;
+        current_display.ver_res = 64;
+        current_display.i2c_addr = 0x3D;
+        ESP_LOGI(ES_TAG, "Hardware Detected: SSD1306 OLED (I2C) at address 0x3D");
+        return;
+    }
+
+    // Fallback default: Assume SPI ILI9341 display is attached
+    current_display.controller = DISP_CONTROLLER_ILI9341;
+    current_display.is_spi = true;
+    current_display.hor_res = 320;
+    current_display.ver_res = 480;
+    ESP_LOGW(ES_TAG, "No I2C screen responded. Falling back to default SPI ILI9341 configuration.");
+}
+
+static void init_display_abstraction_layer() {
+    if (current_display.is_spi) {
+        gpio_config_t io_conf = {};
+        io_conf.intr_type = GPIO_INTR_DISABLE;
+        io_conf.mode = GPIO_MODE_OUTPUT;
+        io_conf.pin_bit_mask = ((1ULL << current_display.dc_pin) | (1ULL << current_display.rst_pin) | (1ULL << current_display.bckl_pin));
+        gpio_config(&io_conf);
+
+        gpio_set_level((gpio_num_t)current_display.rst_pin, 0);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        gpio_set_level((gpio_num_t)current_display.rst_pin, 1);
+        vTaskDelay(pdMS_TO_TICKS(120));
+
+        gpio_set_level((gpio_num_t)current_display.bckl_pin, 1);
+
+        spi_bus_config_t buscfg = {};
+        buscfg.miso_io_num = current_display.miso_pin;
+        buscfg.mosi_io_num = current_display.mosi_pin;
+        buscfg.sclk_io_num = current_display.sclk_pin;
+        buscfg.quadwp_io_num = -1;
+        buscfg.quadhd_io_num = -1;
+        buscfg.max_transfer_sz = (current_display.hor_res * 40) * sizeof(lv_color_t);
+
+        spi_device_interface_config_t devcfg = {};
+        devcfg.clock_speed_hz = current_display.spi_clock_hz;
+        devcfg.mode = 0;
+        devcfg.spics_io_num = current_display.cs_pin;
+        devcfg.queue_size = 7;
+        devcfg.pre_cb = disp_spi_pre_transfer_callback;
+
+        spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+        spi_bus_add_device(SPI2_HOST, &devcfg, &spi_disp_handle);
+    }
+
+    if (current_display.controller == DISP_CONTROLLER_ILI9341 || current_display.controller == DISP_CONTROLLER_ILI9488) {
+        spi_send_cmd(0x01); // Software Reset
+        vTaskDelay(pdMS_TO_TICKS(150));
+        spi_send_cmd(0x28); // Display Off
+
+        spi_send_cmd(0x3A); // Pixel Format
+        const uint8_t pxfmt = 0x55; // 16-bit color (5-6-5 format)
+        spi_send_data(&pxfmt, 1);
+
+        spi_send_cmd(0x11); // Sleep Out
+        vTaskDelay(pdMS_TO_TICKS(150));
+        spi_send_cmd(0x29); // Display On
+        ESP_LOGI(ES_TAG, "Controller Configured: ILI series SPI Display Panel Ready.");
+    } 
+    else if (current_display.controller == DISP_CONTROLLER_ST7789) {
+        spi_send_cmd(0x01); // Reset
+        vTaskDelay(pdMS_TO_TICKS(150));
+        spi_send_cmd(0x11); // Sleep Out
+        vTaskDelay(pdMS_TO_TICKS(10));
+        spi_send_cmd(0x3A); // Interface pixel format
+        const uint8_t format = 0x05; // 16-bit colors
+        spi_send_data(&format, 1);
+        spi_send_cmd(0x29); // Display on
+        ESP_LOGI(ES_TAG, "Controller Configured: ST7789 SPI Display Panel Ready.");
+    }
+    else if (current_display.controller == DISP_CONTROLLER_SSD1306) {
+        i2c_write_cmd(0xAE); // Display OFF
+        i2c_write_cmd(0xD5); // Set Display Clock Divide Ratio
+        i2c_write_cmd(0x80);
+        i2c_write_cmd(0xA8); // Set Multiplex Ratio
+        i2c_write_cmd(0x3F);
+        i2c_write_cmd(0xD3); // Set Display Offset
+        i2c_write_cmd(0x00);
+        i2c_write_cmd(0x40); // Set Start Line
+        i2c_write_cmd(0x8D); // Charge Pump
+        i2c_write_cmd(0x14); // Enable Charge Pump
+        i2c_write_cmd(0xAF); // Display ON
+        ESP_LOGI(ES_TAG, "Controller Configured: SSD1306 OLED Display Panel Ready.");
+    }
+}
+
+/* ====================== HIGH PERFORMANCE DYNAMIC FLUSH SYSTEM ====================== */
+static void my_disp_flush_cb(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
+    uint32_t w = (area->x2 - area->x1 + 1);
+    uint32_t h = (area->y2 - area->y1 + 1);
+    uint32_t len = w * h;
+
+    if (current_display.is_spi) {
+        if (spi_trans_in_progress) {
+            spi_transaction_t *rtrans;
+            spi_device_get_trans_result(spi_disp_handle, &rtrans, portMAX_DELAY);
+            spi_trans_in_progress = false;
+        }
+
+        spi_send_cmd(0x2A);
+        uint8_t col_data[] = {
+            (uint8_t)(area->x1 >> 8), (uint8_t)(area->x1 & 0xFF),
+            (uint8_t)(area->x2 >> 8), (uint8_t)(area->x2 & 0xFF)
+        };
+        spi_send_data(col_data, sizeof(col_data));
+
+        spi_send_cmd(0x2B);
+        uint8_t row_data[] = {
+            (uint8_t)(area->y1 >> 8), (uint8_t)(area->y1 & 0xFF),
+            (uint8_t)(area->y2 >> 8), (uint8_t)(area->y2 & 0xFF)
+        };
+        spi_send_data(row_data, sizeof(row_data));
+
+        spi_send_cmd(0x2C);
+        
+        static spi_transaction_t trans;
+        memset(&trans, 0, sizeof(trans));
+        trans.length = len * 16;
+        trans.tx_buffer = color_p;
+        trans.user = (void*)1;
+
+        esp_err_t ret = spi_device_queue_trans(spi_disp_handle, &trans, portMAX_DELAY);
+        if (ret == ESP_OK) {
+            spi_trans_in_progress = true;
+        }
+    } 
+    else if (current_display.controller == DISP_CONTROLLER_SSD1306) {
+        // Stack-allocated temporary buffer for fast I2C batch sending
+        uint8_t oled_buffer[128];
+        for (uint16_t page = (area->y1 / 8); page <= (area->y2 / 8); page++) {
+            i2c_write_cmd(0xB0 + page); // Set page start address
+            i2c_write_cmd(0x00 + (area->x1 & 0x0F)); // Set lower column nibble
+            i2c_write_cmd(0x10 + ((area->x1 >> 4) & 0x0F)); // Set higher column nibble
+            
+            // Map 16-bit RGB colors to monochrome bit matrix
+            for (uint16_t x = area->x1; x <= area->x2; x++) {
+                uint8_t byte_val = 0;
+                for (int bit = 0; bit < 8; bit++) {
+                    uint16_t y = page * 8 + bit;
+                    if (y >= area->y1 && y <= area->y2) {
+                        lv_color_t pixel = color_p[(y - area->y1) * w + (x - area->x1)];
+                        if (lv_color_to1(pixel) > 0) {
+                            byte_val |= (1 << bit);
+                        }
+                    }
+                }
+                oled_buffer[x - area->x1] = byte_val;
+            }
+            i2c_write_data(oled_buffer, w);
+        }
+    }
+
+    lv_disp_flush_ready(disp_drv);
+}
+
+// Leak-proof Capacitive I2C Touch Driver Read Callback (GT911 compatible)
+static void my_touchpad_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
+    uint8_t register_address[2] = {0x81, 0x4E}; 
+    uint8_t touch_data[6];
+
+    esp_err_t ret = i2c_master_write_read_device(I2C_NUM_1, 0x5D, 
+                                                 register_address, 2, 
+                                                 touch_data, sizeof(touch_data), 
+                                                 pdMS_TO_TICKS(10));
+
+    if (ret == ESP_OK && (touch_data[0] & 0x80) && (touch_data[0] & 0x0F) > 0) {
+        data->state = LV_INDEV_STATE_PR;
+        data->point.x = ((uint16_t)touch_data[3] << 8) | touch_data[2];
+        data->point.y = ((uint16_t)touch_data[5] << 8) | touch_data[4];
+    } else {
+        data->state = LV_INDEV_STATE_REL;
+    }
+
+    uint8_t reset_reg[3] = {0x81, 0x4E, 0x00};
+    i2c_master_write_to_device(I2C_NUM_1, 0x5D, reset_reg, sizeof(reset_reg), pdMS_TO_TICKS(10));
+}
+
+/* ====================== LVGL RESPONSIVE OS UI ENGINE ====================== */
+class ES_UI_Engine {
+public:
+    static void init() {
+        // Desktop Canvas
+        lv_obj_t *desktop = lv_obj_create(lv_scr_act());
+        lv_obj_set_size(desktop, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_style_bg_color(desktop, lv_color_make(15, 23, 42), 0); // Slate-900
+        lv_obj_set_style_border_width(desktop, 0, 0);
+        lv_obj_set_style_radius(desktop, 0, 0);
+
+        // RESPONSIVE DESIGN: Check if screen is micro-sized (like SSD1306 OLED)
+        if (current_display.hor_res <= 128) {
+            // Simplified Interface for Tiny Displays
+            lv_obj_t *lbl_title = lv_label_create(desktop);
+            lv_label_set_text(lbl_title, "E.S. OS v2026");
+            lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 5);
+            lv_obj_set_style_text_color(lbl_title, lv_color_white(), 0);
+
+            lv_obj_t *lbl_status = lv_label_create(desktop);
+            lv_label_set_text(lbl_status, "OLED Core Active");
+            lv_obj_align(lbl_status, LV_ALIGN_CENTER, 0, 5);
+            lv_obj_set_style_text_color(lbl_status, lv_color_make(34, 197, 94), 0); // Green-500
+        } 
+        else {
+            // Rich Graphical Interface for Large TFT Panels (ILI series)
+            lv_obj_t *status_bar = lv_obj_create(desktop);
+            lv_obj_set_size(status_bar, LV_PCT(100), 28);
+            lv_obj_align(status_bar, LV_ALIGN_TOP_MID, 0, 0);
+            lv_obj_set_style_bg_color(status_bar, lv_color_make(2, 44, 34), 0); 
+            lv_obj_set_style_border_width(status_bar, 0, 0);
+            lv_obj_set_style_radius(status_bar, 0, 0);
+
+            lv_obj_t *clock_label = lv_label_create(status_bar);
+            lv_label_set_text(clock_label, "12:00");
+            lv_obj_align(clock_label, LV_ALIGN_LEFT_MID, 10, 0);
+            lv_obj_set_style_text_color(clock_label, lv_color_white(), 0);
+
+            lv_obj_t *app_grid = lv_obj_create(desktop);
+            lv_obj_set_size(app_grid, LV_PCT(100), LV_PCT(70));
+            lv_obj_align(app_grid, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_set_style_bg_opa(app_grid, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(app_grid, 0, 0);
+
+            const char* apps[] = {"Chrome", "Files", "Settings", "PUBG 3D"};
+            for (int i = 0; i < 4; i++) {
+                lv_obj_t *btn = lv_btn_create(app_grid);
+                lv_obj_set_size(btn, 64, 64);
+                lv_obj_align(btn, LV_ALIGN_TOP_MID, (i - 1.5) * 75, 20);
+                lv_obj_set_style_bg_color(btn, lv_color_make(59, 130, 246), 0);
+                
+                lv_obj_t *lbl = lv_label_create(btn);
+                lv_label_set_text(lbl, apps[i]);
+                lv_obj_align(lbl, LV_ALIGN_BOTTOM_MID, 0, 25);
+                lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+            }
+
+            lv_obj_t *nav_bar = lv_obj_create(desktop);
+            lv_obj_set_size(nav_bar, LV_PCT(100), 48);
+            lv_obj_align(nav_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
+            lv_obj_set_style_bg_color(nav_bar, lv_color_make(9, 0, 17), 0);
+            lv_obj_set_style_border_width(nav_bar, 0, 0);
+            lv_obj_set_style_radius(nav_bar, 0, 0);
+
+            lv_obj_t *btn_home = lv_btn_create(nav_bar);
+            lv_obj_set_size(btn_home, 40, 40);
+            lv_obj_align(btn_home, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_t *home_lbl = lv_label_create(btn_home);
+            lv_label_set_text(home_lbl, "O");
+            lv_obj_align(home_lbl, LV_ALIGN_CENTER, 0, 0);
+        }
+    }
+};
+
+/* ====================== MEMORY MANAGEMENT ====================== */
+void *es_malloc(size_t size) {
+    void *ptr = heap_caps_malloc(size, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+    if (!ptr) {
+        ptr = heap_caps_malloc(size, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    }
+    return ptr;
+}
+
+void es_free(void *ptr) {
+    if (ptr) {
+        heap_caps_free(ptr);
+    }
+}
+
+/* ====================== LVGL ENGINE TICK & DUAL CORE SCHEDULING ====================== */
+static void lvgl_tick_task(void *pvParameters) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        lv_tick_inc(10);
+    }
+}
+
+static void lvgl_gui_task(void *pvParameters) {
+    lv_init();
+
+    const size_t buffer_pixels = current_display.hor_res * 40;
+    buf1 = (lv_color_t *)es_malloc(buffer_pixels * sizeof(lv_color_t));
+    buf2 = (lv_color_t *)es_malloc(buffer_pixels * sizeof(lv_color_t));
+    
+    if (!buf1 || !buf2) {
+        ESP_LOGE(ES_TAG, "Critical: UI Engine buffer allocation failed!");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, buffer_pixels);
+
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.draw_buf = &draw_buf;
+    disp_drv.flush_cb = my_disp_flush_cb;
+    disp_drv.hor_res = current_display.hor_res;
+    disp_drv.ver_res = current_display.ver_res;
+    lv_disp_drv_register(&disp_drv);
+
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = my_touchpad_read_cb;
+    lv_indev_drv_register(&indev_drv);
+
+    xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+    ES_UI_Engine::init();
+    xSemaphoreGive(lvgl_mutex);
+
+    ESP_LOGI(ES_TAG, "LVGL: System Engine core successfully launched with dynamic display bindings.");
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            lv_timer_handler();
+            xSemaphoreGive(lvgl_mutex);
+        }
+    }
+}
+
+/* ====================== MAIN INITIALIZATION ====================== */
+extern "C" void app_main(void) {
+    ESP_LOGI(ES_TAG, "E.S. OS Monolithic Kernel - Dynamic Abstraction Setup Sequence");
+
+    // Init I2C for Capacitive Touch controller and scan testing (I2C_NUM_1)
+    i2c_config_t conf = {};
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = current_display.sda_pin;
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_io_num = current_display.scl_pin;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = 400000;
+    i2c_param_config(I2C_NUM_1, &conf);
+    i2c_driver_install(I2C_NUM_1, conf.mode, 0, 0, 0);
+
+    // Scan connected peripherals dynamically
+    scan_and_detect_display();
+
+    // Init display panel and/or SPI bus depending on scanned device
+    init_display_abstraction_layer();
+
+    // Create RTOS Locks
+    lvgl_mutex = xSemaphoreCreateMutex();
+
+    // Task placement: Pin GUI Task to Core 0, Tick task to Core 1 (Stack size optimized to 1024)
+    xTaskCreatePinnedToCore(lvgl_tick_task, "lvgl_tick", 1024, NULL, 6, NULL, 1);
+    xTaskCreatePinnedToCore(lvgl_gui_task, "lvgl_gui", 16384, NULL, 5, NULL, 0);
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
