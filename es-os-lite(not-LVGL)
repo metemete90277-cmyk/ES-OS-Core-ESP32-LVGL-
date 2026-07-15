@@ -1,0 +1,377 @@
+/*
+ *  esp32/main/es_os_lite_animated.cpp
+ *
+ *  E.S. OS Lite (With Retro Animations) - Zero Dependency Monolithic Kernel
+ *  Features real-time 30FPS animations (Bouncing Box & Sine Wave) with NO libraries.
+ * 
+ *  Copyright (C) 2026  ES Corporation Development Core Team
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <math.h> // For fast FPU sine-wave calculations
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+
+#define ES_TAG "ES_OS_LITE_ANIM"
+
+// Basic 8x8 ASCII Font Map
+const uint8_t es_font_8x8[96][8] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // Space
+    {0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00}, // !
+    {0x24, 0x24, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00}, // "
+    {0x24, 0x24, 0x7F, 0x24, 0x7F, 0x24, 0x24, 0x00}, // #
+    {0x08, 0x3E, 0x09, 0x3E, 0x20, 0x3E, 0x08, 0x00}, // $
+    {0x24, 0x06, 0x09, 0x10, 0x20, 0x48, 0x30, 0x24}, // %
+    {0x10, 0x28, 0x28, 0x10, 0x2A, 0x24, 0x1A, 0x00}, // &
+    {0x08, 0x18, 0x18, 0x08, 0x00, 0x00, 0x00, 0x00}, // '
+    {0x08, 0x10, 0x20, 0x20, 0x20, 0x10, 0x08, 0x00}, // (
+    {0x10, 0x08, 0x04, 0x04, 0x04, 0x08, 0x10, 0x00}, // )
+    {0x00, 0x24, 0x18, 0x7E, 0x18, 0x24, 0x00, 0x00}, // *
+    {0x00, 0x08, 0x08, 0x3E, 0x08, 0x08, 0x00, 0x00}, // +
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x08}, // ,
+    {0x00, 0x00, 0x00, 0x3E, 0x00, 0x00, 0x00, 0x00}, // -
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00}, // .
+    {0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x00}, // /
+    {0x3C, 0x46, 0x4A, 0x52, 0x62, 0x62, 0x3C, 0x00}, // 0
+    {0x18, 0x28, 0x08, 0x08, 0x08, 0x08, 0x3E, 0x00}, // 1
+    {0x3C, 0x42, 0x02, 0x3C, 0x40, 0x40, 0x7E, 0x00}, // 2
+    {0x3E, 0x02, 0x02, 0x3E, 0x02, 0x02, 0x3E, 0x00}, // 3
+    {0x08, 0x18, 0x28, 0x48, 0x7E, 0x08, 0x08, 0x00}, // 4
+    {0x7E, 0x40, 0x40, 0x7C, 0x02, 0x42, 0x3C, 0x00}, // 5
+    {0x3C, 0x40, 0x40, 0x7C, 0x42, 0x42, 0x3C, 0x00}, // 6
+    {0x7E, 0x02, 0x04, 0x08, 0x10, 0x10, 0x10, 0x00}, // 7
+    {0x3C, 0x42, 0x42, 0x3C, 0x42, 0x42, 0x3C, 0x00}, // 8
+    {0x3C, 0x42, 0x42, 0x3E, 0x02, 0x02, 0x3E, 0x00}, // 9
+    {0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x00}, // :
+    {0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x08}, // ;
+    {0x04, 0x08, 0x10, 0x20, 0x10, 0x08, 0x04, 0x00}, // <
+    {0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00}, // =
+    {0x20, 0x10, 0x08, 0x04, 0x08, 0x10, 0x20, 0x00}, // >
+    {0x3C, 0x42, 0x02, 0x04, 0x08, 0x00, 0x08, 0x00}, // ?
+    {0x3C, 0x42, 0x5E, 0x56, 0x5E, 0x40, 0x3C, 0x00}, // @
+    {0x18, 0x24, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x00}, // A
+    {0x7C, 0x22, 0x22, 0x3C, 0x22, 0x22, 0x7C, 0x00}, // B
+    {0x3C, 0x40, 0x40, 0x40, 0x40, 0x42, 0x3C, 0x00}, // C
+    {0x78, 0x24, 0x22, 0x22, 0x22, 0x24, 0x78, 0x00}, // D
+    {0x7E, 0x40, 0x40, 0x78, 0x40, 0x40, 0x7E, 0x00}, // E
+    {0x7E, 0x40, 0x40, 0x78, 0x40, 0x40, 0x40, 0x00}, // F
+    {0x3E, 0x40, 0x40, 0x4E, 0x42, 0x42, 0x3E, 0x00}, // G
+    {0x42, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x42, 0x00}, // H
+    {0x3E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x3E, 0x00}, // I
+    {0x02, 0x02, 0x02, 0x02, 0x02, 0x42, 0x3C, 0x00}, // J
+    {0x44, 0x48, 0x50, 0x60, 0x50, 0x48, 0x44, 0x00}, // K
+    {0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x7E, 0x00}, // L
+    {0x42, 0x66, 0x5A, 0x42, 0x42, 0x42, 0x42, 0x00}, // M
+    {0x42, 0x62, 0x52, 0x4A, 0x46, 0x42, 0x42, 0x00}, // N
+    {0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00}, // O
+    {0x7C, 0x42, 0x42, 0x7C, 0x40, 0x40, 0x40, 0x00}, // P
+    {0x3C, 0x42, 0x42, 0x42, 0x4A, 0x44, 0x3A, 0x00}, // Q
+    {0x7C, 0x42, 0x42, 0x7C, 0x48, 0x44, 0x42, 0x00}, // R
+    {0x3E, 0x40, 0x40, 0x3C, 0x02, 0x02, 0x7C, 0x00}, // S
+    {0x7E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00}, // T
+    {0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00}, // U
+    {0x42, 0x42, 0x42, 0x42, 0x24, 0x24, 0x18, 0x00}, // V
+    {0x42, 0x42, 0x42, 0x4A, 0x5A, 0x66, 0x42, 0x00}, // W
+    {0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x42, 0x00}, // X
+    {0x42, 0x42, 0x24, 0x18, 0x08, 0x08, 0x08, 0x00}, // Y
+    {0x7E, 0x02, 0x04, 0x08, 0x10, 0x20, 0x7E, 0x00}  // Z
+};
+
+typedef enum {
+    LITE_DISP_ILI9341,
+    LITE_DISP_SSD1306,
+    LITE_DISP_UNKNOWN
+} lite_disp_type_t;
+
+typedef struct {
+    lite_disp_type_t type;
+    int sda_pin;
+    int scl_pin;
+    int mosi_pin;
+    int sclk_pin;
+    int cs_pin;
+    int dc_pin;
+    int rst_pin;
+    uint16_t width;
+    uint16_t height;
+} es_lite_config_t;
+
+static es_lite_config_t hw_config = {
+    .type = LITE_DISP_UNKNOWN,
+    .sda_pin = 21,
+    .scl_pin = 22,
+    .mosi_pin = 23,
+    .sclk_pin = 18,
+    .cs_pin = 5,
+    .dc_pin = 2,
+    .rst_pin = 4,
+    .width = 128,
+    .height = 64
+};
+
+static spi_device_handle_t spi_handle = NULL;
+
+/* ====================== PROTOCOLS ====================== */
+static void i2c_quick_cmd(uint8_t cmd) {
+    uint8_t buf[2] = {0x00, cmd};
+    i2c_master_write_to_device(I2C_NUM_0, 0x3C, buf, 2, pdMS_TO_TICKS(5));
+}
+
+static void i2c_quick_data(const uint8_t *data, size_t len) {
+    uint8_t *temp = (uint8_t *)malloc(len + 1);
+    if (!temp) return;
+    temp[0] = 0x40;
+    memcpy(&temp[1], data, len);
+    i2c_master_write_to_device(I2C_NUM_0, 0x3C, temp, len + 1, pdMS_TO_TICKS(10));
+    free(temp);
+}
+
+static void spi_quick_cmd(uint8_t cmd) {
+    gpio_set_level((gpio_num_t)hw_config.dc_pin, 0);
+    spi_transaction_t t = {};
+    t.length = 8;
+    t.tx_buffer = &cmd;
+    spi_device_polling_transmit(spi_handle, &t);
+}
+
+static void spi_quick_data(const uint8_t *data, size_t len) {
+    gpio_set_level((gpio_num_t)hw_config.dc_pin, 1);
+    spi_transaction_t t = {};
+    t.length = len * 8;
+    t.tx_buffer = data;
+    spi_device_polling_transmit(spi_handle, &t);
+}
+
+/* ====================== HARDWARE SCAN & DETECT ====================== */
+static void run_lite_hardware_scan() {
+    ESP_LOGI(ES_TAG, "Scanning for SSD1306 OLED...");
+    esp_err_t ret = i2c_master_write_to_device(I2C_NUM_0, 0x3C, NULL, 0, pdMS_TO_TICKS(10));
+    
+    if (ret == ESP_OK) {
+        hw_config.type = LITE_DISP_SSD1306;
+        hw_config.width = 128;
+        hw_config.height = 64;
+        ESP_LOGI(ES_TAG, "OLED detected! Activating fast monochrome frame buffer.");
+    } else {
+        hw_config.type = LITE_DISP_ILI9341;
+        hw_config.width = 320;
+        hw_config.height = 240;
+        ESP_LOGI(ES_TAG, "SPI TFT found. Fast-booting SPI driver.");
+    }
+}
+
+/* ====================== RETRO GRAPHICS & LINE ENGINES ====================== */
+static uint8_t frame_buffer_mono[1024]; // Minimal 1KB Buffer
+
+static void clear_screen() {
+    if (hw_config.type == LITE_DISP_SSD1306) {
+        memset(frame_buffer_mono, 0, sizeof(frame_buffer_mono));
+    } else if (hw_config.type == LITE_DISP_ILI9341) {
+        spi_quick_cmd(0x2A);
+        uint8_t cols[] = {0, 0, (uint8_t)(319 >> 8), (uint8_t)(319 & 0xFF)};
+        spi_quick_data(cols, 4);
+        spi_quick_cmd(0x2B);
+        uint8_t rows[] = {0, 0, (uint8_t)(239 >> 8), (uint8_t)(239 & 0xFF)};
+        spi_quick_data(rows, 4);
+        spi_quick_cmd(0x2C);
+        uint8_t black_line[320 * 2] = {0};
+        for (int i = 0; i < 240; i++) {
+            spi_quick_data(black_line, sizeof(black_line));
+        }
+    }
+}
+
+static void draw_pixel(int x, int y, uint16_t color) {
+    if (x < 0 || x >= hw_config.width || y < 0 || y >= hw_config.height) return;
+
+    if (hw_config.type == LITE_DISP_SSD1306) {
+        if (color > 0) {
+            frame_buffer_mono[x + (y / 8) * 128] |= (1 << (y % 8));
+        } else {
+            frame_buffer_mono[x + (y / 8) * 128] &= ~(1 << (y % 8));
+        }
+    }
+}
+
+// Bresenham's High-Performance Integer-Only Line Algorithm (Zero floats!)
+static void draw_line(int x0, int y0, int x1, int y1, uint16_t color) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy, e2;
+
+    while (1) {
+        draw_pixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+// Hollow rectangle drawing using our fast lines
+static void draw_rect(int x, int y, int w, int h, uint16_t color) {
+    draw_line(x, y, x + w - 1, y, color);
+    draw_line(x, y + h - 1, x + w - 1, y + h - 1, color);
+    draw_line(x, y, x, y + h - 1, color);
+    draw_line(x + w - 1, y, x + w - 1, y + h - 1, color);
+}
+
+static void draw_text(int x, int y, const char *str, uint16_t color) {
+    while (*str) {
+        char c = *str++;
+        if (c < 32 || c > 127) continue;
+        uint8_t char_index = c - 32;
+
+        for (int col = 0; col < 8; col++) {
+            uint8_t line = es_font_8x8[char_index][col];
+            for (int row = 0; row < 8; row++) {
+                if (line & (1 << row)) {
+                    draw_pixel(x + col, y + row, color);
+                }
+            }
+        }
+        x += 8;
+    }
+}
+
+static void flush_display_pipeline() {
+    if (hw_config.type == LITE_DISP_SSD1306) {
+        for (uint8_t page = 0; page < 8; page++) {
+            i2c_quick_cmd(0xB0 + page);
+            i2c_quick_cmd(0x00);
+            i2c_quick_cmd(0x10);
+            i2c_quick_data(&frame_buffer_mono[page * 128], 128);
+        }
+    }
+}
+
+/* ====================== DRIVER INITIALIZATION ====================== */
+static void init_lite_hardware() {
+    if (hw_config.type == LITE_DISP_SSD1306) {
+        i2c_quick_cmd(0xAE);
+        i2c_quick_cmd(0x8D);
+        i2c_quick_cmd(0x14);
+        i2c_quick_cmd(0xAF);
+    } 
+    else if (hw_config.type == LITE_DISP_ILI9341) {
+        gpio_config_t io_conf = {};
+        io_conf.mode = GPIO_MODE_OUTPUT;
+        io_conf.pin_bit_mask = ((1ULL << hw_config.dc_pin) | (1ULL << hw_config.rst_pin));
+        gpio_config(&io_conf);
+
+        gpio_set_level((gpio_num_t)hw_config.rst_pin, 0);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        gpio_set_level((gpio_num_t)hw_config.rst_pin, 1);
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        spi_bus_config_t buscfg = {};
+        buscfg.miso_io_num = -1;
+        buscfg.mosi_io_num = hw_config.mosi_pin;
+        buscfg.sclk_io_num = hw_config.sclk_pin;
+        buscfg.quadwp_io_num = -1;
+        buscfg.quadhd_io_num = -1;
+
+        spi_device_interface_config_t devcfg = {};
+        devcfg.clock_speed_hz = 26 * 1000 * 1000;
+        devcfg.mode = 0;
+        devcfg.spics_io_num = hw_config.cs_pin;
+        devcfg.queue_size = 3;
+
+        spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+        spi_bus_add_device(SPI2_HOST, &devcfg, &spi_handle);
+
+        spi_quick_cmd(0x01);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        spi_quick_cmd(0x11);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        spi_quick_cmd(0x29);
+    }
+}
+
+/* ====================== SMOOTH 30FPS ANIMATED OS LOOP ====================== */
+static void es_os_main_task(void *pvParameters) {
+    clear_screen();
+
+    // DVD Bouncing Box variables
+    float box_x = 10.0f;
+    float box_y = 16.0f;
+    float speed_x = 1.6f;
+    float speed_y = 1.1f;
+    const int box_width = 38;
+    const int box_height = 14;
+
+    // Sine wave variables
+    float wave_phase = 0.0f;
+
+    while (1) {
+        clear_screen();
+
+        if (hw_config.type == LITE_DISP_SSD1306) {
+            // 1. Static Top Header (Status Bar)
+            draw_text(16, 0, "--- E.S. OS LITE ---", 1);
+            draw_line(0, 9, 127, 9, 1);
+
+            // 2. Animated Bouncing DVD-style Box
+            box_x += speed_x;
+            box_y += speed_y;
+
+            // Boundaries protection
+            if (box_x <= 0 || box_x + box_width >= 128) {
+                speed_x = -speed_x;
+            }
+            if (box_y <= 11 || box_y + box_height >= 48) { // Confine box above the sine wave area
+                speed_y = -speed_y;
+            }
+
+            // Draw bounding box & label
+            draw_rect((int)box_x, (int)box_y, box_width, box_height, 1);
+            draw_text((int)box_x + 5, (int)box_y + 3, "E.S.", 1);
+
+            // 3. Dynamic Sine Wave / Oscilloscope Animation
+            wave_phase += 0.15f;
+            for (int x = 0; x < 128; x++) {
+                // Generates a smooth floating-point sine wave locked at 56px Y base
+                int y = 56 + (int)(6.0f * sinf((x * 0.1f) + wave_phase));
+                draw_pixel(x, y, 1);
+            }
+        } 
+        else {
+            // Fallback Console Status for Large SPI TFT Panels
+            ESP_LOGI(ES_TAG, "Active Screen: ILI9341 - Rendering Console Core.");
+        }
+
+        // Send memory buffer to the physical panel
+        flush_display_pipeline();
+
+        // ~33ms delay = Smooth 30 FPS Render Speed
+        vTaskDelay(pdMS_TO_TICKS(33));
+    }
+}
+
+extern "C" void app_main(void) {
+    ESP_LOGI(ES_TAG, "Booting E.S. OS Animated Core...");
+
+    // Setup I2C
+    i2c_config_t conf = {};
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = hw_config.sda_pin;
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_io_num = hw_config.scl_pin;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = 400000;
+    i2c_param_config(I2C_NUM_0, &conf);
+    i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
+
+    run_lite_hardware_scan();
+    init_lite_hardware();
+
+    // Pin UI task to ESP32 APP CPU (Core 1) to keep PRO CPU (Core 0) free for OS tasks!
+    xTaskCreatePinnedToCore(es_os_main_task, "es_os_main", 4096, NULL, 5, NULL, 1);
+}
+
