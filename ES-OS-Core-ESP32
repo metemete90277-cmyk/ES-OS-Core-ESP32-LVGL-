@@ -40,6 +40,7 @@
 #define I2C_MASTER_SCL_IO 22
 #define I2C_MASTER_NUM    I2C_NUM_1
 #define I2C_MASTER_FREQ_HZ 400000
+#define GT911_I2C_ADDR    0x5D
 
 // Screen dimensions
 #define HOR_RES 320
@@ -55,7 +56,10 @@ static lv_color_t *buf1 = NULL;
 static lv_color_t *buf2 = NULL;
 static lv_disp_drv_t disp_drv;
 
-// Fast DMA SPI transmission write command helper
+// Global flag to track active DMA transactions
+static volatile bool spi_trans_in_progress = false;
+
+// Fast DMA SPI transmission write command helper (using polling for small command bytes)
 static void spi_send_cmd(const uint8_t cmd) {
     spi_transaction_t t;
     memset(&t, 0, sizeof(t));
@@ -65,7 +69,7 @@ static void spi_send_cmd(const uint8_t cmd) {
     spi_device_polling_transmit(spi_disp_handle, &t);
 }
 
-// Fast DMA SPI transmission write data helper
+// Fast DMA SPI transmission write data helper (polling for short setups)
 static void spi_send_data(const uint8_t *data, int len) {
     if (len == 0) return;
     spi_transaction_t t;
@@ -147,8 +151,18 @@ static void init_display_hardware() {
     spi_send_cmd(0x29); // Display ON
 }
 
-// DMA-optimized display flush function
+// High-Performance DMA-driven display flush function
 static void my_disp_flush_cb(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
+    // If there is an active background DMA transfer, wait for it to complete
+    if (spi_trans_in_progress) {
+        spi_transaction_t *rtrans;
+        esp_err_t ret = spi_device_get_trans_result(spi_disp_handle, &rtrans, portMAX_DELAY);
+        if (ret != ESP_OK) {
+            ESP_LOGE(ES_TAG, "SPI DMA Transmit result error: %d", ret);
+        }
+        spi_trans_in_progress = false;
+    }
+
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
     uint32_t len = w * h;
@@ -172,26 +186,34 @@ static void my_disp_flush_cb(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_
     // Memory write command
     spi_send_cmd(0x2C);
     
-    // SPI Transmission of pixel array
-    spi_send_data((uint8_t*)color_p, len * 2);
+    // Async transmission of pixel array via DMA
+    static spi_transaction_t trans;
+    memset(&trans, 0, sizeof(trans));
+    trans.length = len * 16; // 16 bits per pixel (RGB565)
+    trans.tx_buffer = color_p;
+    trans.user = (void*)1; // D/C line HIGH for data
 
+    esp_err_t ret = spi_device_queue_trans(spi_disp_handle, &trans, portMAX_DELAY);
+    if (ret == ESP_OK) {
+        spi_trans_in_progress = true;
+    } else {
+        ESP_LOGE(ES_TAG, "Failed to queue SPI DMA transaction: %d", ret);
+    }
+
+    // Inform LVGL that we are ready to handle the next buffer immediately (Double buffering benefit)
     lv_disp_flush_ready(disp_drv);
 }
 
-// Capacitive I2C Touch Driver Read Callback (GT911 compatible)
+// Leak-proof Capacitive I2C Touch Driver Read Callback (GT911 compatible)
 static void my_touchpad_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
+    uint8_t register_address[2] = {0x81, 0x4E}; // GT911 Status Register
     uint8_t touch_data[6];
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (0x5D << 1) | I2C_MASTER_WRITE, true); // GT911 address
-    i2c_master_write_byte(cmd, 0x81, true); // Status Register High
-    i2c_master_write_byte(cmd, 0x4E, true); // Status Register Low
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (0x5D << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(cmd, touch_data, sizeof(touch_data), I2C_MASTER_LAST_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(10));
-    i2c_cmd_link_delete(cmd);
+
+    // Read Touch Status and Coordinates in one sweep using modern, non-leak ESP-IDF API
+    esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM, GT911_I2C_ADDR, 
+                                                 register_address, 2, 
+                                                 touch_data, sizeof(touch_data), 
+                                                 pdMS_TO_TICKS(10));
 
     if (ret == ESP_OK && (touch_data[0] & 0x80) && (touch_data[0] & 0x0F) > 0) {
         data->state = LV_INDEV_STATE_PR;
@@ -201,16 +223,9 @@ static void my_touchpad_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data
         data->state = LV_INDEV_STATE_REL;
     }
 
-    // Reset buffer status register
-    cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (0x5D << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, 0x81, true);
-    i2c_master_write_byte(cmd, 0x4E, true);
-    i2c_master_write_byte(cmd, 0x00, true); // Clear flag
-    i2c_master_stop(cmd);
-    i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(10));
-    i2c_cmd_link_delete(cmd);
+    // Reset GT911 buffer status register to allow new interrupt/reads
+    uint8_t reset_reg[3] = {0x81, 0x4E, 0x00};
+    i2c_master_write_to_device(I2C_MASTER_NUM, GT911_I2C_ADDR, reset_reg, sizeof(reset_reg), pdMS_TO_TICKS(10));
 }
 
 /* ====================== LVGL OS UI ENGINE ====================== */
@@ -305,6 +320,13 @@ static void lvgl_gui_task(void *pvParameters) {
     // Allocate memory-aligned double buffers for flicker-free DMA performance
     buf1 = (lv_color_t *)es_malloc(LVDISP_BUF_SIZE * sizeof(lv_color_t));
     buf2 = (lv_color_t *)es_malloc(LVDISP_BUF_SIZE * sizeof(lv_color_t));
+    
+    if (buf1 == NULL || buf2 == NULL) {
+        ESP_LOGE(ES_TAG, "Failed to allocate display buffers!");
+        vTaskDelete(NULL);
+        return;
+    }
+
     lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LVDISP_BUF_SIZE);
 
     lv_disp_drv_init(&disp_drv);
@@ -358,8 +380,8 @@ extern "C" void app_main(void) {
     // Create RTOS Locks
     lvgl_mutex = xSemaphoreCreateMutex();
 
-    // Task placement: Pin GUI Task to Core 0, Tick task to Core 1
-    xTaskCreatePinnedToCore(lvgl_tick_task, "lvgl_tick", 2048, NULL, 6, NULL, 1);
+    // Task placement: Pin GUI Task to Core 0, Tick task to Core 1 (Stack size optimized from 2048 to 1024)
+    xTaskCreatePinnedToCore(lvgl_tick_task, "lvgl_tick", 1024, NULL, 6, NULL, 1);
     xTaskCreatePinnedToCore(lvgl_gui_task, "lvgl_gui", 16384, NULL, 5, NULL, 0);
 
     while (1) {
