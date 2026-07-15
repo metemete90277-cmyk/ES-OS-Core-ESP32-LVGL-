@@ -1,1 +1,1 @@
-# ES-OS-Core-ESP32-LVGL-
+# ES-OS-Core-ESP32-LVGL- bu kod lvgl kütüpanesi olan ve dokunmatik ekrana sahip olan esp32ler için yazılmıştır. ILI9341, ST7789, SSD1306, ST7735, ILI9488 ve diğer neredeyse esp32ye takılabilen tüm ekranlarda çalışabilir.kodun içerisinde bir arayüz,oyunlar ve bazı özelleştirmeler mevcuttur
